@@ -1,0 +1,259 @@
+//@version=6
+//==============================================================
+// DIRECTIONAL COMPRESSION BREAKOUT INDICATOR (NIFTY)
+//==============================================================
+//
+// OVERVIEW:
+// This indicator identifies compression zones followed by directional
+// breakouts in price action. It combines multiple technical metrics to
+// detect low-volatility consolidation periods and generates signals when
+// price breaks out of these zones with confirmation filters.
+//
+// CORE CONCEPTS:
+// 1. COMPRESSION DETECTION - Identifies when price is consolidating using:
+//    - ATR slope declining over 3 bars (volatility contracting)
+//    - Bollinger Band Width below 25th percentile (narrow bands)
+//    - 3-day range < 60% of 20-day median range (tight range)
+//    Compression triggers when at least 2 of 3 conditions are met
+//
+// 2. BREAKOUT SIGNALS:
+//    - Raw Breakout (B/S): Price breaks above/below previous 3-bar range
+//    - Confirmed Breakout (B+/S+): Raw breakout + ADX + HTF EMA filters
+//
+// 3. ACCUMULATION SIGNALS:
+//    - Accumulate Calls (AC): During compression, price above EMA near lower BB
+//    - Accumulate Puts (AP): During compression, price below EMA near upper BB
+//
+// SIGNAL TYPES:
+// - AC (Accumulate Call): Bullish accumulation during compression
+// - AP (Accumulate Put): Bearish accumulation during compression
+// - B (Bullish Breakout): Raw upside breakout from compression
+// - S (Bearish Breakout): Raw downside breakout from compression
+// - B+ (Bullish Confirmed): Breakout with ADX and HTF EMA confirmation
+// - S+ (Bearish Confirmed): Breakdown with ADX and HTF EMA confirmation
+//
+// FILTERS (OPTIONAL):
+// - ADX Filter: Ensures directional strength (ADX > 20, DI+ > DI- for bulls)
+// - HTF EMA Filter: Higher timeframe trend alignment (default: 1-hour EMA)
+//
+// VISUAL ELEMENTS:
+// - Yellow background: Active compression zone
+// - Blue line: 20-period EMA (trend reference)
+// - Green/Red lines: Upper/Lower 3-bar range levels
+// - Triangles: Signal markers (small=accumulation, large=breakout)
+// - Circles: Additional markers on confirmed breakouts
+//
+// PARAMETERS:
+// - ATR Length (14): Period for Average True Range calculation
+// - Bollinger Length (20): Period for Bollinger Bands
+// - Bollinger Multiplier (2.0): Standard deviation multiplier
+// - Trend EMA Length (20): EMA period for trend determination
+// - Range Factor (0.6): Compression threshold (3-day vs 20-day range)
+// - ADX Length (14): Period for ADX calculation
+// - ADX Key Level (20): Minimum ADX for confirmed signals
+// - HTF Timeframe (60): Higher timeframe for EMA filter (minutes)
+//
+// USE CASES:
+// - Intraday trading on Nifty and other indices
+// - Identify low-risk entry zones during consolidation
+// - Confirm breakout trades with multiple filters
+// - Reduce false breakouts using compression pre-condition
+//
+// ALERTS:
+// - Bullish/Bearish Breakout (Raw): Immediate breakout signals
+// - Bullish/Bearish Breakout Confirmed (B+/S+): Filtered high-probability signals
+//
+//==============================================================
+
+indicator("Directional Compression Breakout (Nifty)", overlay = true, max_lines_count = 500)
+
+//==============================================================
+// Inputs
+//==============================================================
+
+// Core compression / breakout
+atrLen      = input.int(14,  "ATR Length")
+bbLen       = input.int(20,  "Bollinger Length")
+bbMult      = input.float(2, "Bollinger Multiplier")
+emaLen      = input.int(20,  "Trend EMA Length")
+rangeFactor = input.float(0.6, "3-day Range vs 20-day Median %")
+
+// Filters
+useAdxFilter   = input.bool(true,  "Use ADX Filter for B+ / S+")
+adxLen         = input.int(14,    "ADX Length")
+adxKeyLevel    = input.int(20,    "ADX Key Level")
+
+useHtfFilter   = input.bool(true,  "Use HTF EMA Filter for B+ / S+")
+htfTf          = input.timeframe("60", "HTF for EMA (e.g. 60 = 1h)")
+
+//==============================================================
+// Core Metrics
+//==============================================================
+atr  = ta.atr(atrLen)
+ema  = ta.ema(close, emaLen)
+
+// 20-EMA on price
+plot(ema, "20 EMA", color = color.new(color.blue, 0))
+
+// Bollinger Bands & BandWidth
+basis   = ta.sma(close, bbLen)
+dev     = bbMult * ta.stdev(close, bbLen)
+upperBB = basis + dev
+lowerBB = basis - dev
+bbw     = (upperBB - lowerBB) / basis * 100.0  // normalized bandwidth
+
+//==============================================================
+// Compression Logic
+//==============================================================
+
+// 1) ATR slope falling 3 bars
+atrDown = atr < atr[1] and atr[1] < atr[2]
+
+// 2) Bandwidth Compression: below 25% of last 100 bars
+bbwLowThreshold = ta.percentile_nearest_rank(bbw, 100, 25)
+bbwComp         = bbw <= bbwLowThreshold
+
+// 3) 3-day vs 20-day range
+range3     = ta.highest(high, 3) - ta.lowest(low, 3)
+range20Med = ta.percentile_nearest_rank(high - low, 20, 50)
+rangeComp  = range3 < (range20Med * rangeFactor)
+
+// Compression score
+compressionScore = (atrDown ? 1 : 0) + (bbwComp ? 1 : 0) + (rangeComp ? 1 : 0)
+compressionOn    = compressionScore >= 2
+
+//==============================================================
+// Breakout Levels (IMPORTANT: use previous 3 bars ONLY)
+//==============================================================
+high3 = ta.highest(high[1], 3)   // last 3 completed bars
+low3  = ta.lowest(low[1],  3)
+
+// Raw breakout triggers
+bullBreak = close > high3 and close > ema and compressionOn
+bearBreak = close < low3  and close < ema and compressionOn
+
+//==============================================================
+// Accumulation Signals (inside compression)
+//==============================================================
+// Accumulate Calls: compression, above EMA, closer to lower band / mid
+bullAccum = compressionOn and close > ema and close <= basis and close > lowerBB
+
+// Accumulate Puts: compression, below EMA, closer to upper band / mid
+bearAccum = compressionOn and close < ema and close >= basis and close < upperBB
+
+//==============================================================
+// Filters for confirmed B+ / S+
+//==============================================================
+
+// --- ADX filter ---
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+bullAdx = adxVal > adxKeyLevel and diPlus > diMinus
+bearAdx = adxVal > adxKeyLevel and diMinus > diPlus
+
+// --- HTF EMA filter ---
+htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaLen), lookahead = barmerge.lookahead_on)
+bullHtf = close > htfEma
+bearHtf = close < htfEma
+
+// Final confirmed breakout conditions
+bullBreakConf = bullBreak and (not useAdxFilter or bullAdx) and (not useHtfFilter or bullHtf)
+bearBreakConf = bearBreak and (not useAdxFilter or bearAdx) and (not useHtfFilter or bearHtf)
+
+//==============================================================
+// Visuals
+//==============================================================
+
+// Compression background
+bgcolor(compressionOn ? color.new(color.yellow, 85) : na)
+
+// Range channel
+plot(high3, "Upper Range (prev 3 bars)", color = color.new(color.green, 0))
+plot(low3,  "Lower Range (prev 3 bars)", color = color.new(color.red,   0))
+
+// --- Accumulation markers ---
+plotshape(
+     bullAccum,
+     title     = "Accumulate Call",
+     text      = "AC",
+     style     = shape.triangleup,
+     location  = location.belowbar,
+     color     = color.new(color.lime, 0),
+     size      = size.small,
+     textcolor = color.blue)
+
+plotshape(
+     bearAccum,
+     title     = "Accumulate Put",
+     text      = "AP",
+     style     = shape.triangledown,
+     location  = location.abovebar,
+     color     = color.new(color.red, 0),
+     size      = size.small,
+     textcolor = color.blue)
+
+// --- Raw breakout (B / S) ---
+plotshape(
+     bullBreak,
+     title     = "Bullish Breakout (Raw)",
+     text      = "B",
+     style     = shape.triangleup,
+     location  = location.belowbar,
+     color     = color.new(color.lime, 0),
+     size      = size.large)
+
+plotshape(
+     bearBreak,
+     title     = "Bearish Breakout (Raw)",
+     text      = "S",
+     style     = shape.triangledown,
+     location  = location.abovebar,
+     color     = color.new(color.red, 0),
+     size      = size.large)
+
+// --- Confirmed breakouts (B+ / S+) ---
+plotshape(
+     bullBreakConf,
+     title     = "Bullish Breakout Confirmed (B+)",
+     text      = "B+",
+     style     = shape.triangleup,
+     location  = location.belowbar,
+     color     = color.new(color.lime, 0),
+     size      = size.large)
+
+plotshape(
+     bearBreakConf,
+     title     = "Bearish Breakout Confirmed (S+)",
+     text      = "S+",
+     style     = shape.triangledown,
+     location  = location.abovebar,
+     color     = color.new(color.red, 0),
+     size      = size.large)
+
+// Circles on confirmed breakouts
+plotshape(
+     bullBreakConf,
+     title    = "Bullish Confirmation Circle",
+     style    = shape.circle,
+     location = location.belowbar,
+     color    = color.new(color.lime, 0),
+     size     = size.tiny)
+
+plotshape(
+     bearBreakConf,
+     title    = "Bearish Confirmation Circle",
+     style    = shape.circle,
+     location = location.abovebar,
+     color    = color.new(color.red, 0),
+     size     = size.tiny)
+
+//==============================================================
+// Alerts
+//==============================================================
+
+// Raw breakouts
+alertcondition(bullBreak, "Bullish Breakout (Raw)", "Compression breakout UP (raw).")
+alertcondition(bearBreak, "Bearish Breakout (Raw)", "Compression breakout DOWN (raw).")
+
+// Confirmed breakouts (filtered)
+alertcondition(bullBreakConf, "Bullish Breakout B+", "Compression + Breakout + Filters aligned (BULL).")
+alertcondition(bearBreakConf, "Bearish Breakout S+", "Compression + Breakout + Filters aligned (BEAR).")

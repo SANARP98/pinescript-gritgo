@@ -1,0 +1,337 @@
+//@version=6
+//==============================================================
+// ORB ALGO | BUY/SELL ONLY
+//==============================================================
+// Original: Flux Charts ORB Algo
+// Modified: Simplified version keeping ORB detection & Buy/Sell signals only
+//
+// OVERVIEW:
+// Opening Range Breakout (ORB) strategy that identifies the high and low
+// during the first N minutes of a trading session, then generates buy/sell
+// signals when price breaks out of this range with confirmation retests.
+//
+// CORE CONCEPTS:
+// 1. OPENING RANGE (OR):
+//    - Defined by the high/low during the specified timeframe (default: 30 min)
+//    - Starts at session open (regular or custom session)
+//    - Creates a support/resistance zone for the rest of the session
+//
+// 2. BREAKOUT DETECTION:
+//    - Bullish Breakout: Price/EMA crosses above OR high
+//    - Bearish Breakout: Price/EMA crosses below OR low
+//    - Can use Close price or EMA for breakout confirmation
+//
+// 3. RETEST & ENTRY LOGIC:
+//    - After initial breakout, waits for retests of OR boundary
+//    - Sensitivity controls required retests before entry:
+//      * High: 0 retests (immediate entry)
+//      * Medium: 1 retest (default)
+//      * Low: 2 retests
+//      * Lowest: 3 retests
+//    - Entry triggers when retest requirement is met
+//
+// 4. FAILED BREAKOUTS:
+//    - If price crosses back inside OR after breakout, it's marked as failed
+//    - System returns to "Waiting For Breakouts" state
+//    - Can generate new breakout signals in opposite direction
+//
+// SIGNAL TYPES:
+// - Buy Signal: Bullish breakout with required retests completed
+// - Sell Signal: Bearish breakout with required retests completed
+//
+// VISUAL ELEMENTS:
+// - Green/Red Lines: OR high/low boundaries
+// - Buy/Sell Labels: Entry points with direction
+// - HTF S/R Lines: Higher timeframe support/resistance (1H & 30m)
+//
+// PARAMETERS:
+// - ORB Timeframe (30): Opening range duration in minutes
+// - Sensitivity (Medium): How many retests required before entry
+// - Breakout Condition (Close): Use Close or EMA for breakout detection
+// - EMA Length (9): Period for EMA calculation
+// - Custom Session: Optional session time override (default: regular session)
+//
+// HTF SUPPORT/RESISTANCE:
+// - 1H S/R: Previous 1-hour candle high/low (blue lines)
+// - 30m S/R: Previous 30-minute candle high/low (orange lines)
+// - Helps identify key levels that may act as barriers or targets
+//
+// VISUAL OPTIONS:
+// - Draw ORB Zones: Show/hide OR boundary lines
+// - Plot EMA: Display the EMA line used for breakout detection
+// - Show Historic ORBs: Display all past ORBs or only current session
+// - Customizable colors for all visual elements
+//
+// ALERTS:
+// - Buy Signal: Triggered on bullish entry confirmation
+// - Sell Signal: Triggered on bearish entry confirmation
+//
+// USE CASES:
+// - Intraday momentum trading on indices (Nifty, Bank Nifty, etc.)
+// - Capturing early session volatility and directional moves
+// - Filtering false breakouts using retest confirmation
+// - Combining with HTF S/R for better entry/exit timing
+//
+// IMPORTANT NOTES:
+// - Only works on timeframes lower than 15 minutes
+// - Designed for instruments with clear session open (e.g., stock indices)
+// - Single entry per ORB session (no multiple entries)
+// - Position management (SL/TP) should be handled externally
+//
+// STRATEGY WORKFLOW:
+// 1. Session Opens → Start tracking Opening Range
+// 2. OR Period Ends → Establish high/low boundaries
+// 3. Wait For Breakout → Monitor for price crossing boundaries
+// 4. Breakout Occurs → Enter "In Breakout" state
+// 5. Monitor Retests → Count valid retests of boundary
+// 6. Entry Triggered → Generate Buy/Sell signal when retests sufficient
+// 7. Entry Taken → No more signals until next session
+//
+//==============================================================
+
+indicator("ORB Algo | Buy/Sell Only", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 5000)
+
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Inputs
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+orbTimeStr   = input.timeframe("30", "ORB Timeframe", group = "Algorithm")
+sensitivity  = input.string("Medium", "Sensitivity", options = ["High", "Medium", "Low", "Lowest"], group = "Algorithm")
+breakoutCond = input.string("Close", "Breakout Condition", options = ["Close", "EMA"], group = "Algorithm")
+emaLength    = input.int(9, "EMA Length", options = [4, 9, 13, 20, 34], group = "Algorithm")
+
+customSessionEnabled = input.bool(false, "Use Custom Session", group = "Custom Session")
+customSessionTime    = input.session("1000-1100", "Session", group = "Custom Session")
+
+showORBZones  = input.bool(true, "Draw ORB Zones", group = "Visuals")
+plotEMA       = input.bool(false, "Plot EMA", group = "Visuals")
+showHistoric  = input.bool(true, "Show Historic ORBs", group = "Visuals")
+
+highColor = input.color(color.green, "High Line", group = "Visuals", inline = "colors")
+lowColor  = input.color(color.red,   "Low Line",  group = "Visuals", inline = "colors")
+
+// HTF Support/Resistance
+show1hSR    = input.bool(true,  "Show 1H S/R", group = "HTF S/R")
+show30mSR   = input.bool(true,  "Show 30m S/R", group = "HTF S/R")
+sr1hResCol  = input.color(color.new(color.blue, 0),  "1H Resistance", group = "HTF S/R", inline = "1h")
+sr1hSupCol  = input.color(color.new(color.blue, 60), "1H Support",    group = "HTF S/R", inline = "1h")
+sr30mResCol = input.color(color.new(color.orange, 0),  "30m Resistance", group = "HTF S/R", inline = "30m")
+sr30mSupCol = input.color(color.new(color.orange, 60), "30m Support",    group = "HTF S/R", inline = "30m")
+
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Basic checks
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+if timeframe.in_seconds() > timeframe.in_seconds("15")
+    runtime.error("ORB Algo only works on timeframes lower than 15 min.")
+
+int maxBarsBack       = last_bar_index
+int renderMaxBarsBack = 5000
+color orbColor        = color.new(#3b3b3b, 75)
+
+// How many retests required before entry?
+retestsNeededForEntry = sensitivity == "High" ? 0 : sensitivity == "Medium" ? 1 : sensitivity == "Low" ? 2 : 3
+
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Types
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+type Breakout
+    bool isBullish
+    int  startIndex
+    int  endIndex
+    bool failed = false
+    int  retests = 0
+
+type ORB
+    float h
+    float l
+    int   startTime
+    int   startIndex
+    int   endIndex
+    bool  isLastSession
+
+    string state = "Opening Range"
+    array<Breakout> breakouts
+
+    bool  foundEntryTick = false
+    bool  entryBullish
+    int   entryIndex
+    float entryPrice
+    float entryATR
+
+    line  hLine
+    line  lLine
+    label entryLabel
+
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Helper functions
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+getPosition(positionText) =>
+    positionText == "Top Right"     ? position.top_right  :
+     positionText == "Top Center"   ? position.top_center :
+     positionText == "Right Center" ? position.middle_right :
+                                      position.middle_left
+
+createORB(float h, float l, int sT, int sI, int eI) =>
+    newORB = ORB.new(h, l, sT, sI, eI)
+    newORB.breakouts := array.new<Breakout>(0)
+    newORB
+
+safeDeleteORB(ORB orb) =>
+    line.delete(orb.hLine)
+    line.delete(orb.lLine)
+    label.delete(orb.entryLabel)
+
+renderORB(ORB orb) =>
+    if orb.startIndex > last_bar_index - renderMaxBarsBack
+        if showORBZones
+            orb.hLine := line.new(orb.startIndex, orb.h, nz(orb.endIndex, last_bar_index), orb.h, color = highColor, width = 2)
+            orb.lLine := line.new(orb.startIndex, orb.l, nz(orb.endIndex, last_bar_index), orb.l, color = lowColor, width = 2)
+        if not na(orb.entryIndex)
+            orb.entryLabel := label.new(
+                 orb.entryIndex,
+                 orb.entryPrice + orb.entryATR * 3 * (orb.entryBullish ? -1 : 1),
+                 orb.entryBullish ? "Buy" : "Sell",
+                 color     = orb.entryBullish ? color.green : color.red,
+                 textcolor = color.white,
+                 style     = orb.entryBullish ? label.style_label_up : label.style_label_down)
+
+sessionBegins(sess) =>
+    t        = time("1440", sess)
+    is_first = (na(t[1]) and not na(t)) or t[1] < t
+    is_first
+
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Core series
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+ema = ta.ema((high + low) / 2.0, emaLength)
+atr = ta.atr(12)
+plot(plotEMA ? ema : na)
+
+// ORB storage
+var orbList = array.new<ORB>(0)
+
+// Get last ORB reference
+ORB lastORB = na
+if orbList.size() > 0
+    lastORB := orbList.get(0)
+    // reset entry flag each bar; will be set to true on the actual entry bar
+    lastORB.foundEntryTick := false
+
+// Mark last ORB as "last session" (used only if you want to filter later)
+if not na(lastORB)
+    if last_bar_time - time < 60 * 60 * 8 * 1000
+        lastORB.isLastSession := true
+    else
+        lastORB.isLastSession := false
+
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// ORB construction & breakout / entry logic
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+if barstate.isconfirmed and last_bar_index - bar_index < maxBarsBack
+    // New ORB: first bar of session or custom session
+    if (not customSessionEnabled and session.isfirstbar_regular) or
+       (customSessionEnabled and sessionBegins(customSessionTime))
+        // Close previous ORB
+        if not na(lastORB)
+            lastORB.endIndex := bar_index - 1
+        // Start new ORB
+        newORB = createORB(na, na, time, bar_index, na)
+        orbList.unshift(newORB)
+        lastORB := orbList.get(0)
+
+    // Build ORB high/low during opening range
+    if not na(lastORB)
+        inORBWindow = time < lastORB.startTime + timeframe.in_seconds(orbTimeStr) * 1000
+        if lastORB.state == "Opening Range" and inORBWindow
+            lastORB.h := math.max(nz(lastORB.h, 0.0), high)
+            lastORB.l := math.min(nz(lastORB.l,  low),  low)
+
+        // Once ORB window is done, wait for breakouts
+        if lastORB.state == "Opening Range" and not inORBWindow
+            lastORB.state := "Waiting For Breakouts"
+
+    // Breakout detection
+    if not na(lastORB) and lastORB.state == "Waiting For Breakouts"
+        conditionPrice = breakoutCond == "EMA" ? ema : close
+        if conditionPrice > lastORB.h or conditionPrice < lastORB.l
+            newBreakout = Breakout.new(conditionPrice > lastORB.h, bar_index, na)
+            lastORB.breakouts.unshift(newBreakout)
+            lastORB.state := "In Breakout"
+
+    // Handle ongoing breakout: retests & entry
+    if not na(lastORB) and lastORB.state == "In Breakout"
+        curBreakout = lastORB.breakouts.get(0)
+
+        // Failed breakout → go back to waiting
+        if (curBreakout.isBullish and close < lastORB.h) or
+           (not curBreakout.isBullish and close > lastORB.l)
+            curBreakout.failed   := true
+            curBreakout.endIndex := bar_index
+            lastORB.state        := "Waiting For Breakouts"
+
+        // Retest of the ORB boundary
+        if bar_index > curBreakout.startIndex and (
+             (curBreakout.isBullish and close > lastORB.h and low  < lastORB.h) or
+             (not curBreakout.isBullish and close < lastORB.l and high > lastORB.l))
+            curBreakout.retests += 1
+
+        // Enough retests → take entry
+        if curBreakout.retests >= retestsNeededForEntry
+            curBreakout.endIndex   := bar_index
+            lastORB.state          := "Entry Taken"
+            lastORB.entryATR       := atr
+            lastORB.foundEntryTick := true
+            lastORB.entryIndex     := bar_index
+            lastORB.entryPrice     := close
+            lastORB.entryBullish   := curBreakout.isBullish
+
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Alerts: separate Buy / Sell
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+bool buySignal  = false
+bool sellSignal = false
+
+if not na(lastORB) and lastORB.foundEntryTick
+    if lastORB.entryBullish
+        buySignal := true
+    else
+        sellSignal := true
+
+alertcondition(buySignal,  "Buy Signal",  "ORB Buy Entry Signal")
+alertcondition(sellSignal, "Sell Signal", "ORB Sell Entry Signal")
+
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Higher-TF Support / Resistance (1H & 30m)
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// We use previous closed candle high/low for 1H and 30m as S/R.
+htfHigh1h = request.security(syminfo.tickerid, "D", high, barmerge.gaps_off, barmerge.lookahead_off)
+htfLow1h  = request.security(syminfo.tickerid, "D", low,  barmerge.gaps_off, barmerge.lookahead_off)
+htfHigh30 = request.security(syminfo.tickerid, "W", high, barmerge.gaps_off, barmerge.lookahead_off)
+htfLow30  = request.security(syminfo.tickerid, "W", low,  barmerge.gaps_off, barmerge.lookahead_off)
+
+prevHigh1h = htfHigh1h[1]
+prevLow1h  = htfLow1h[1]
+prevHigh30 = htfHigh30[1]
+prevLow30  = htfLow30[1]
+
+plot(show1hSR  ? prevHigh1h : na, "1H Resistance", color = sr1hResCol, style = plot.style_linebr)
+plot(show1hSR  ? prevLow1h  : na, "1H Support",    color = sr1hSupCol, style = plot.style_linebr)
+plot(show30mSR ? prevHigh30 : na, "30m Resistance", color = sr30mResCol, style = plot.style_linebr)
+plot(show30mSR ? prevLow30  : na, "30m Support",    color = sr30mSupCol, style = plot.style_linebr)
+
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Render ORB lines & labels
+//–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+if barstate.islast and orbList.size() > 0
+    // If showHistoric is true, render all ORBs; else only the most recent one.
+    lastIdx = showHistoric ? orbList.size() - 1 : 0
+    for i = 0 to lastIdx by 1
+        curORB = orbList.get(i)
+        safeDeleteORB(curORB)
+        renderORB(curORB)
+
+// Series for ORB entry price (only on entry bar)
+float entryPriceSeries = na
+if not na(lastORB) and lastORB.foundEntryTick
+    entryPriceSeries := lastORB.entryPrice
+
+plot(entryPriceSeries, "Entry Price", display = display.none)
